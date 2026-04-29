@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
-// https://kl.busz.in/api/where/stops-for-route/01_qihp.json?key=e0a817e1-b494-49da-8599-31a65208014f
-// ─── API config ───────────────────────────────────────────────────────────────
-const DEFAULT_ROUTE_ID = '01_qihp';
-const API_BASE_URL = 'https://kl.busz.in/api/where/stops-for-route';
-const API_KEY  = 'e0a817e1-b494-49da-8599-31a65208014f';
+
+
+
+const STOPS_API_BASE_URL = import.meta.env.VITE_STOPS_API_BASE_URL;
+const TRIPS_API_BASE_URL = import.meta.env.VITE_TRIPS_API_BASE_URL;
+const API_KEY = import.meta.env.VITE_API_KEY;
+const DEFAULT_ROUTE_ID = '01_fm94';
 
 // ─── SVG layout constants (SVG units — scale with viewBox) ───────────────────
 const U = {
@@ -27,11 +29,12 @@ U.BUS_AREA_RIGHT_X = U.STOP_X + U.STOP_W + U.STOP_MX + U.NODE_AREA;
 U.COL_W            = U.LEFT_BUS_W + U.NODE_AREA + U.STOP_MX + U.STOP_W
                    + U.STOP_MX + U.NODE_AREA + U.RIGHT_BUS_W;
 
-const STOP_H   = 20;                             // stop box height in SVG units
-const STOP_TOP = (U.ROW_H - STOP_H) / 2;        // vertical offset to center box in row
+const STOP_H   = 20;
+const STOP_TOP = (U.ROW_H - STOP_H) / 2;
 
 const rowY = (i) => i * U.ROW_H + U.ROW_H / 2;
-const routeUrl = (routeId) => `${API_BASE_URL}/${encodeURIComponent(routeId)}.json`;
+const stopsUrl = (routeId) => `${STOPS_API_BASE_URL}/${encodeURIComponent(routeId)}.json`;
+const tripsUrl = (routeId) => `${TRIPS_API_BASE_URL}/${encodeURIComponent(routeId)}.json`;
 
 const MOJIBAKE_RE = /(?:à|Ã|Â|â|€|œ||™|‹|¢|¥|¦|§|¨|©|ª|«|¬|®|¯|°|±|²|³|´|µ|¶|·|¸|¹|º|»|¼|½|¾|¿)/;
 const WINDOWS_1252_BYTES = new Map([
@@ -55,9 +58,7 @@ function decodeMojibake(value) {
   if (typeof value !== 'string') {
     return value;
   }
-
   let decoded = value;
-
   for (let i = 0; i < 3 && MOJIBAKE_RE.test(decoded); i += 1) {
     try {
       const next = new TextDecoder('utf-8', { fatal: true }).decode(recoverMojibakeBytes(decoded));
@@ -69,14 +70,12 @@ function decodeMojibake(value) {
       break;
     }
   }
-
   return decoded;
 }
 
-// Bus box geometry + connector line endpoints
 function getBusGeometry(bus, ox) {
   const connY      = rowY(bus.connectIndex);
-  const boxCenterY = rowY(bus.connectIndex - 2);
+  const boxCenterY = rowY(Math.max(0, bus.connectIndex - 2)); 
   const boxTop     = boxCenterY - U.BUS_H / 2;
 
   if (bus.side === 'left') {
@@ -92,14 +91,45 @@ function getBusGeometry(bus, ox) {
   }
 }
 
-// Auto-place 4 buses at proportional positions along the route
-function makeBusConfig(stopCount) {
-  return [
-    { id: 'Bus 1', connectIndex: 2,                            side: 'left',  bg: '#4fc3f7', fg: '#01579b' },
-    { id: 'Bus 2', connectIndex: Math.floor(stopCount * 0.30), side: 'right', bg: '#f28b8b', fg: '#7f0000' },
-    { id: 'Bus 3', connectIndex: Math.floor(stopCount * 0.55), side: 'left',  bg: '#aed581', fg: '#33691e' },
-    { id: 'Bus 4', connectIndex: Math.floor(stopCount * 0.80), side: 'right', bg: '#aed581', fg: '#33691e' },
-  ];
+function processActiveBuses(tripsData, stopsArray) {
+  if (!tripsData || !tripsData.list) return [];
+
+  const activeTrips = tripsData.list.filter(
+    (trip) => trip.status && (trip.status.phase === "in_progress" || trip.status.phase === "")
+  );
+
+  const buses = [];
+  const occupiedSpots = new Set(); 
+
+  activeTrips.forEach((trip, idx) => {
+    const closestStopId = trip.status.closestStop;
+    const connectIndex = stopsArray.findIndex((s) => s.id === closestStopId);
+
+    if (connectIndex !== -1) {
+      let side = 'left';
+      if (occupiedSpots.has(`${connectIndex}-left`)) {
+        side = 'right';
+      }
+      occupiedSpots.add(`${connectIndex}-${side}`);
+
+      const bg = side === 'left' ? '#4fc3f7' : '#f28b8b';
+      const fg = side === 'left' ? '#01579b' : '#7f0000';
+
+      const rawId = trip.status.activeTripId || trip.tripId || `Bus ${idx + 1}`;
+      const shortId = rawId.includes('_') ? rawId.split('_').pop().slice(-5) : rawId.slice(-5);
+
+      buses.push({
+        id: shortId,
+        connectIndex,
+        side,
+        bg,
+        fg,
+        rawData: trip 
+      });
+    }
+  });
+
+  return buses;
 }
 
 function formatRouteLabel(route) {
@@ -115,56 +145,69 @@ export default function App() {
   const [selectedRouteId, setSelectedRouteId] = useState(DEFAULT_ROUTE_ID);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState(null);
+  const [tooltip, setTooltip] = useState({ visible: false, x: 0, y: 0, data: null });
 
   useEffect(() => {
     const controller = new AbortController();
+    let intervalId;
+    let currentStops = []; // Keep a reference to stops for the polling loop
+    
+    setLoading(true);
 
-    axios
-      .get(routeUrl(selectedRouteId), {
-        params: { key: API_KEY },
-        signal: controller.signal,
-      })
-      .then((res) => {
-        const apiData = res.data.data;
+    // 1. Initial Load: Fetch both Stops and current Trips
+    Promise.all([
+      axios.get(stopsUrl(selectedRouteId), { params: { key: API_KEY }, signal: controller.signal }),
+      axios.get(tripsUrl(selectedRouteId), { params: { key: API_KEY }, signal: controller.signal })
+    ])
+      .then(([stopsRes, tripsRes]) => {
+        const stopsApiData = stopsRes.data.data;
+        const tripsApiData = tripsRes.data.data;
 
-        // Ordered stop IDs for this route
-        const orderedIds =
-          apiData.entry.stopGroupings[0].stopGroups[0].stopIds;
-
-        // id → stop object lookup
+        const orderedIds = stopsApiData.entry.stopGroupings[0].stopGroups[0].stopIds;
         const stopMap = {};
-        apiData.references.stops.forEach((s) => { stopMap[s.id] = s; });
+        stopsApiData.references.stops.forEach((s) => { stopMap[s.id] = s; });
 
-        if (apiData.references.routes?.length) {
-          setRouteOptions(apiData.references.routes);
+        if (stopsApiData.references.routes?.length) {
+          setRouteOptions(stopsApiData.references.routes);
         }
 
-        // Ordered stops with id + name
-        const stops = orderedIds.map((id) => ({
+        currentStops = orderedIds.map((id) => ({
           id,
           name: decodeMojibake(stopMap[id]?.name ?? id),
         }));
 
-        const buses  = makeBusConfig(stops.length);
-        const column = { stops, buses };
-        setColumns([column, { ...column }, { ...column }]);
+        const buses = processActiveBuses(tripsApiData, currentStops);
+
+        setColumns([{ stops: currentStops, buses }]); 
         setLoading(false);
+
+        // 2. Background Polling: Fetch ONLY trips every 5 seconds
+        intervalId = setInterval(() => {
+          axios.get(tripsUrl(selectedRouteId), { params: { key: API_KEY } })
+            .then((res) => {
+              const updatedBuses = processActiveBuses(res.data.data, currentStops);
+              // Update state silently in the background
+              setColumns([{ stops: currentStops, buses: updatedBuses }]);
+            })
+            .catch((err) => console.error("Polling failed:", err));
+        }, 5000);
+
       })
       .catch((err) => {
-        if (axios.isCancel(err) || err.name === 'CanceledError') {
-          return;
-        }
-
+        if (axios.isCancel(err) || err.name === 'CanceledError') return;
         setError(err.message);
         setLoading(false);
       });
 
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      if (intervalId) clearInterval(intervalId); // Cleanup interval on unmount
+    };
   }, [selectedRouteId]);
 
   const handleRouteChange = (event) => {
     setSelectedRouteId(event.target.value);
-    setLoading(true);
+    setLoading(true); // Show loading spinner only when changing routes manually
     setError(null);
     setColumns([]);
   };
@@ -179,7 +222,28 @@ export default function App() {
   const VB_H    = maxRows * U.ROW_H;
 
   return (
-    <div className="w-full min-h-screen bg-white">
+    <div className="w-full min-h-screen bg-white relative">
+      
+      {/* ── Tooltip Overlay ── */}
+      {tooltip.visible && tooltip.data && (
+        <div 
+          className="fixed z-50 bg-white border border-slate-200 shadow-xl rounded-lg p-4 text-xs text-slate-700 pointer-events-none w-72 transition-opacity duration-200"
+          style={{ top: tooltip.y + 15, left: tooltip.x + 15 }}
+        >
+          <h4 className="font-bold text-slate-900 mb-2 border-b pb-1 text-sm">Bus Details</h4>
+          <div className="flex flex-col gap-1.5">
+            <p><span className="font-semibold text-slate-500">Trip ID:</span> {tooltip.data.tripId}</p>
+            <p><span className="font-semibold text-slate-500">Vehicle ID:</span> {tooltip.data.status.vehicleId || tooltip.data.status.activeTripId || 'N/A'}</p>
+            <p><span className="font-semibold text-slate-500">Phase:</span> {tooltip.data.status.phase || 'N/A'}</p>
+            <p><span className="font-semibold text-slate-500">Distance Along Trip:</span> {tooltip.data.status.totalDistanceAlongTrip?.toFixed(2)}m</p>
+            <p><span className="font-semibold text-slate-500">Sched Deviation:</span> {tooltip.data.status.scheduleDeviation}s</p>
+            <p><span className="font-semibold text-slate-500">Next Stop Offset:</span> {tooltip.data.status.nextStopTimeOffset}s</p>
+            <p><span className="font-semibold text-slate-500">Lat/Lon:</span> {tooltip.data.status.position?.lat?.toFixed(4)}, {tooltip.data.status.position?.lon?.toFixed(4)}</p>
+            <p><span className="font-semibold text-slate-500">Last Update:</span> {new Date(tooltip.data.status.lastUpdateTime || tooltip.data.serviceDate).toLocaleTimeString()}</p>
+          </div>
+        </div>
+      )}
+
       <div className="sticky top-0 z-10 w-full border-b border-gray-200 bg-white px-4 py-3">
         <div className="mx-auto flex max-w-5xl flex-wrap items-center gap-3">
           <label className="flex items-center gap-2 text-sm font-medium text-gray-700">
@@ -196,8 +260,13 @@ export default function App() {
               ))}
             </select>
           </label>
-          {loading && <span className="text-sm text-gray-500">Loading route data...</span>}
+          {loading && <span className="text-sm text-gray-500 flex items-center gap-2">
+             <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#e5e7eb" strokeWidth="3" /><path d="M12 2a10 10 0 0 1 10 10" stroke="#6b7280" strokeWidth="3" strokeLinecap="round" /></svg> Loading route data...
+          </span>}
           {error && <span className="text-sm font-medium text-red-500">Error: {error}</span>}
+          {!loading && !error && <span className="text-xs text-emerald-500 font-medium ml-auto flex items-center gap-1">
+             <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span> Live Sync Active
+          </span>}
         </div>
       </div>
 
@@ -232,7 +301,7 @@ export default function App() {
               <line x1={ox + U.LEFT_NODE_X}  y1={0} x2={ox + U.LEFT_NODE_X}  y2={colH} stroke="#111" strokeWidth={2} />
               <line x1={ox + U.RIGHT_NODE_X} y1={0} x2={ox + U.RIGHT_NODE_X} y2={colH} stroke="#111" strokeWidth={2} />
 
-              {/* ── Connector lines (behind everything) ── */}
+              {/* ── Connector lines (Animated) ── */}
               {col.buses.map((bus) => {
                 const { lx1, ly1, lx2, ly2 } = getBusGeometry(bus, ox);
                 return (
@@ -240,21 +309,14 @@ export default function App() {
                     key={bus.id + '-line'}
                     x1={lx1} y1={ly1} x2={lx2} y2={ly2}
                     stroke="#555" strokeWidth={1}
+                    className="transition-all duration-700 ease-in-out" // Smoothes the line movement
                   />
                 );
               })}
 
-              {/* ── Stop boxes ──────────────────────────────────────────────
-                  WHY foreignObject:
-                  SVG <text> uses a basic glyph renderer that cannot handle
-                  complex scripts — Malayalam ligatures and conjuncts break.
-                  <foreignObject> hands rendering to the HTML engine, which
-                  uses the OS shaping stack (HarfBuzz / CoreText / DirectWrite)
-                  and correctly renders any Unicode script including Malayalam.
-              ── */}
+              {/* ── Stop boxes ── */}
               {col.stops.map((stop, i) => (
                 <g key={'stop-' + i}>
-                  {/* Yellow background rect */}
                   <rect
                     x={ox + U.STOP_X}
                     y={i * U.ROW_H + STOP_TOP}
@@ -265,17 +327,12 @@ export default function App() {
                     strokeWidth={0.5}
                   />
 
-                  {/* HTML text via foreignObject — handles Malayalam correctly */}
                   <foreignObject
                     x={ox + U.STOP_X}
                     y={i * U.ROW_H + STOP_TOP}
                     width={U.STOP_W}
                     height={STOP_H}
                   >
-                    {/*
-                      xmlns is required — foreignObject content must declare
-                      the XHTML namespace for browsers to parse it correctly.
-                    */}
                     <div
                       xmlns="http://www.w3.org/1999/xhtml"
                       style={{
@@ -302,7 +359,7 @@ export default function App() {
                 </g>
               ))}
 
-              {/* ── Node dots (on top of lines) ── */}
+              {/* ── Node dots ── */}
               {col.stops.map((_, i) => (
                 <React.Fragment key={'node-' + i}>
                   <circle cx={ox + U.LEFT_NODE_X}  cy={rowY(i)} r={U.NODE_R} fill="#111" />
@@ -310,17 +367,33 @@ export default function App() {
                 </React.Fragment>
               ))}
 
-              {/* ── Bus label boxes ── */}
+              {/* ── Bus label boxes (Animated & Interactive) ── */}
               {col.buses.map((bus) => {
                 const { boxLeft, boxTop } = getBusGeometry(bus, ox);
                 return (
-                  <g key={bus.id + '-box'}>
+                  <g 
+                    key={bus.id + '-box'}
+                    className="cursor-pointer hover:opacity-80 transition-all duration-700 ease-in-out" // Smoothes the box & text movement
+                    onMouseEnter={(e) => {
+                      setTooltip({
+                        visible: true,
+                        x: e.clientX,
+                        y: e.clientY,
+                        data: bus.rawData
+                      });
+                    }}
+                    onMouseMove={(e) => {
+                      setTooltip(prev => ({ ...prev, x: e.clientX, y: e.clientY }));
+                    }}
+                    onMouseLeave={() => {
+                      setTooltip({ visible: false, x: 0, y: 0, data: null });
+                    }}
+                  >
                     <rect
                       x={boxLeft} y={boxTop}
                       width={U.BUS_W} height={U.BUS_H}
                       fill={bus.bg} stroke="#555" strokeWidth={1} rx={4}
                     />
-                    {/* Bus labels are English — plain SVG text is fine here */}
                     <text
                       x={boxLeft + U.BUS_W / 2}
                       y={boxTop  + U.BUS_H / 2}
@@ -329,6 +402,7 @@ export default function App() {
                       fontSize={11}
                       fontWeight="500"
                       fill={bus.fg}
+                      className="pointer-events-none"
                     >
                       {bus.id}
                     </text>

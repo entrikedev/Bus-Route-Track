@@ -12,6 +12,18 @@ dist
 dist-ssr
 *.local
 
+bus-route/node_modules
+bus-route/dist
+bus-route/dist-ssr
+bus-route/*.env
+bus-route/.env.local
+bus-route/.env.development
+bus-route/.env.production
+bus-route/.env.test
+bus-route/.env
+
+
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
