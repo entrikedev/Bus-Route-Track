@@ -2,11 +2,11 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 
 
-
 const STOPS_API_BASE_URL = import.meta.env.VITE_STOPS_API_BASE_URL;
 const TRIPS_API_BASE_URL = import.meta.env.VITE_TRIPS_API_BASE_URL;
 const API_KEY = import.meta.env.VITE_API_KEY;
 const DEFAULT_ROUTE_ID = '01_fm94';
+
 
 // ─── SVG layout constants (SVG units — scale with viewBox) ───────────────────
 const U = {
@@ -270,9 +270,9 @@ export default function App() {
         </div>
       </div>
 
-      <div className="w-full flex items-start justify-center p-4 overflow-x-auto">
+      <div className={`w-full flex items-start p-4 overflow-x-auto ${hasDiagram ? 'justify-start' : 'justify-center'}`}>
         {loading && !hasDiagram ? (
-          <div className="flex min-h-96 flex-col items-center justify-center gap-3 text-gray-500">
+          <div className="flex min-h-96 w-full flex-col items-center justify-center gap-3 text-gray-500">
             <svg className="animate-spin w-8 h-8" viewBox="0 0 24 24" fill="none">
               <circle cx="12" cy="12" r="10" stroke="#e5e7eb" strokeWidth="3" />
               <path d="M12 2a10 10 0 0 1 10 10" stroke="#6b7280" strokeWidth="3" strokeLinecap="round" />
@@ -280,7 +280,7 @@ export default function App() {
             <span className="text-sm font-medium">Loading route data...</span>
           </div>
         ) : error && !hasDiagram ? (
-          <div className="flex min-h-96 items-center justify-center">
+          <div className="flex min-h-96 w-full items-center justify-center">
             <p className="text-red-500 text-sm font-medium">Error: {error}</p>
           </div>
         ) : (
