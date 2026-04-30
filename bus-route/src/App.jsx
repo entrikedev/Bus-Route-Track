@@ -54,6 +54,8 @@ function recoverMojibakeBytes(value) {
   });
 }
 
+
+
 function decodeMojibake(value) {
   if (typeof value !== 'string') {
     return value;
@@ -72,6 +74,9 @@ function decodeMojibake(value) {
   }
   return decoded;
 }
+
+
+
 
 function getBusGeometry(bus, ox) {
   const connY      = rowY(bus.connectIndex);
@@ -141,80 +146,150 @@ function formatRouteLabel(route) {
 // ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
   const [columns, setColumns] = useState([]);
-  const [routeOptions, setRouteOptions] = useState([]);
-  const [selectedRouteId, setSelectedRouteId] = useState(DEFAULT_ROUTE_ID);
+  const [allRoutes, setAllRoutes] = useState([]);
+  const [selectedRouteIds, setSelectedRouteIds] = useState([DEFAULT_ROUTE_ID]);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState(null);
   const [tooltip, setTooltip] = useState({ visible: false, x: 0, y: 0, data: null });
 
   useEffect(() => {
     const controller = new AbortController();
-    let intervalId;
-    let currentStops = []; // Keep a reference to stops for the polling loop
-    
-    setLoading(true);
-
-    // 1. Initial Load: Fetch both Stops and current Trips
-    Promise.all([
-      axios.get(stopsUrl(selectedRouteId), { params: { key: API_KEY }, signal: controller.signal }),
-      axios.get(tripsUrl(selectedRouteId), { params: { key: API_KEY }, signal: controller.signal })
-    ])
-      .then(([stopsRes, tripsRes]) => {
-        const stopsApiData = stopsRes.data.data;
-        const tripsApiData = tripsRes.data.data;
-
-        const orderedIds = stopsApiData.entry.stopGroupings[0].stopGroups[0].stopIds;
-        const stopMap = {};
-        stopsApiData.references.stops.forEach((s) => { stopMap[s.id] = s; });
-
-        if (stopsApiData.references.routes?.length) {
-          setRouteOptions(stopsApiData.references.routes);
+    axios.get(stopsUrl(DEFAULT_ROUTE_ID), { params: { key: API_KEY }, signal: controller.signal })
+      .then(res => {
+        if (res.data?.data?.references?.routes?.length) {
+          setAllRoutes(res.data.data.references.routes);
         }
-
-        currentStops = orderedIds.map((id) => ({
-          id,
-          name: decodeMojibake(stopMap[id]?.name ?? id),
-        }));
-
-        const buses = processActiveBuses(tripsApiData, currentStops);
-
-        setColumns([{ stops: currentStops, buses }]); 
-        setLoading(false);
-
-        // 2. Background Polling: Fetch ONLY trips every 5 seconds
-        intervalId = setInterval(() => {
-          axios.get(tripsUrl(selectedRouteId), { params: { key: API_KEY } })
-            .then((res) => {
-              const updatedBuses = processActiveBuses(res.data.data, currentStops);
-              // Update state silently in the background
-              setColumns([{ stops: currentStops, buses: updatedBuses }]);
-            })
-            .catch((err) => console.error("Polling failed:", err));
-        }, 5000);
-
       })
       .catch((err) => {
         if (axios.isCancel(err) || err.name === 'CanceledError') return;
+        console.error("Failed to fetch route list:", err);
+      });
+
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const intervalIds = [];
+
+    if (selectedRouteIds.length === 0) {
+      setColumns([]);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    const fetchDataForRoutes = async () => {
+      try {
+        const routeDataPromises = selectedRouteIds.map(routeId =>
+          Promise.all([
+            axios.get(stopsUrl(routeId), { params: { key: API_KEY }, signal: controller.signal }),
+            axios.get(tripsUrl(routeId), { params: { key: API_KEY }, signal: controller.signal })
+          ]).catch(err => ({ error: err, routeId }))
+        );
+
+        const results = await Promise.all(routeDataPromises);
+
+        // If the component unmounted or effect re-ran, stop processing
+        if (controller.signal.aborted) return;
+
+        const newColumns = [];
+        const errors = [];
+
+        results.forEach((result, index) => {
+          if (result.error) {
+            // Safely ignore canceled requests
+            if (axios.isCancel(result.error) || result.error.name === 'CanceledError') return;
+
+            errors.push(`Failed to load route ${result.routeId}: ${result.error.message}`);
+            return;
+          }
+
+          const [stopsRes, tripsRes] = result;
+          const stopsApiData = stopsRes.data.data;
+          const tripsApiData = tripsRes.data.data;
+          const routeId = selectedRouteIds[index];
+
+          const stopGroups = stopsApiData.entry.stopGroupings[0]?.stopGroups;
+          if (!stopGroups || stopGroups.length === 0) {
+            errors.push(`No stop groups found for route ${routeId}.`);
+            return;
+          }
+          const orderedIds = stopGroups[0].stopIds;
+          const stopMap = {};
+          stopsApiData.references.stops.forEach((s) => { stopMap[s.id] = s; });
+
+          const currentStops = orderedIds.map((id) => ({
+            id,
+            name: decodeMojibake(stopMap[id]?.name ?? id),
+          }));
+
+          const buses = processActiveBuses(tripsApiData, currentStops);
+
+          newColumns.push({ stops: currentStops, buses, routeId });
+        });
+
+        if (errors.length > 0) {
+          setError(errors.join('; '));
+        }
+
+        setColumns(newColumns);
+        setLoading(false);
+
+        newColumns.forEach((column) => {
+          const intervalId = setInterval(() => {
+            axios.get(tripsUrl(column.routeId), { params: { key: API_KEY } })
+              .then((res) => {
+                const updatedBuses = processActiveBuses(res.data.data, column.stops);
+                setColumns(prevColumns => {
+                  const targetIndex = prevColumns.findIndex(c => c.routeId === column.routeId);
+                  if (targetIndex === -1) return prevColumns;
+
+                  const nextColumns = [...prevColumns];
+                  nextColumns[targetIndex] = { ...nextColumns[targetIndex], buses: updatedBuses };
+                  return nextColumns;
+                });
+              })
+              .catch((err) => console.error(`Polling for route ${column.routeId} failed:`, err));
+          }, 5000);
+          intervalIds.push(intervalId);
+        });
+
+      } catch (err) {
+        if (axios.isCancel(err) || err.name === 'CanceledError') return;
         setError(err.message);
         setLoading(false);
-      });
+      }
+    };
+
+    fetchDataForRoutes();
 
     return () => {
       controller.abort();
-      if (intervalId) clearInterval(intervalId); // Cleanup interval on unmount
+      intervalIds.forEach(clearInterval);
     };
-  }, [selectedRouteId]);
+  }, [selectedRouteIds]);
 
-  const handleRouteChange = (event) => {
-    setSelectedRouteId(event.target.value);
-    setLoading(true); // Show loading spinner only when changing routes manually
-    setError(null);
-    setColumns([]);
+  const handleRouteChange = (index, newRouteId) => {
+    setSelectedRouteIds(prev => {
+      const newIds = [...prev];
+      newIds[index] = newRouteId;
+      return newIds;
+    });
   };
 
-  const selectOptions = routeOptions.some((route) => route.id === selectedRouteId)
-    ? routeOptions
-    : [{ id: selectedRouteId, shortName: '', longName: '' }, ...routeOptions];
+  const handleAddRoute = () => {
+    const firstUnselectedRoute = allRoutes.find(opt => !selectedRouteIds.includes(opt.id));
+    const newRouteId = firstUnselectedRoute ? firstUnselectedRoute.id : (allRoutes[0]?.id || DEFAULT_ROUTE_ID);
+    setSelectedRouteIds(prev => [...prev, newRouteId]);
+  };
+
+  const handleRemoveRoute = (index) => {
+    setSelectedRouteIds(prev => prev.filter((_, i) => i !== index));
+  };
+
   const hasDiagram = columns.length > 0;
   const numCols = columns.length || 1;
   const maxRows = hasDiagram ? Math.max(...columns.map((c) => c.stops.length)) : 1;
@@ -245,27 +320,53 @@ export default function App() {
       )}
 
       <div className="sticky top-0 z-10 w-full border-b border-gray-200 bg-white px-4 py-3">
-        <div className="mx-auto flex max-w-5xl flex-wrap items-center gap-3">
-          <label className="flex items-center gap-2 text-sm font-medium text-gray-700">
-            Route
-            <select
-              value={selectedRouteId}
-              onChange={handleRouteChange}
-              className="h-9 min-w-72 rounded border border-gray-300 bg-white px-3 text-sm text-gray-900 shadow-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-            >
-              {selectOptions.map((route) => (
-                <option key={route.id} value={route.id}>
-                  {formatRouteLabel(route)}
-                </option>
-              ))}
-            </select>
-          </label>
+        <div className="flex w-full flex-wrap items-center gap-4">
+          {selectedRouteIds.map((routeId, index) => {
+            const getDropdownOptions = (rId) => {
+              if (allRoutes.some(r => r.id === rId)) return allRoutes;
+              return [{ id: rId, shortName: '', longName: `Route ${rId}` }, ...allRoutes];
+            };
+            const dropdownOptions = getDropdownOptions(routeId);
+
+            return (
+              <div key={index} className="flex items-center gap-2">
+                <label className="flex items-center gap-2 text-sm font-medium text-gray-700">
+                  Route
+                  <select
+                    value={routeId}
+                    onChange={(e) => handleRouteChange(index, e.target.value)}
+                    className="h-9 w-48 sm:w-64 truncate rounded border border-gray-300 bg-white px-3 text-sm text-gray-900 shadow-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                  >
+                    {dropdownOptions.map((route) => (
+                      <option key={route.id} value={route.id}>
+                        {formatRouteLabel(route)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {selectedRouteIds.length > 1 && (
+                  <button
+                    onClick={() => handleRemoveRoute(index)}
+                    className="flex items-center justify-center h-9 w-9 text-lg font-medium text-red-600 bg-red-50 rounded border border-red-200 hover:bg-red-100"
+                    title="Remove Route"
+                  >
+                    &times;
+                  </button>
+                )}
+              </div>
+            );
+          })}
+          {selectedRouteIds.length < 4 && (
+            <button onClick={handleAddRoute} className="h-9 px-4 text-sm font-medium text-white bg-blue-500 rounded hover:bg-blue-600">
+              + Add Route
+            </button>
+          )}
           {loading && <span className="text-sm text-gray-500 flex items-center gap-2">
              <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#e5e7eb" strokeWidth="3" /><path d="M12 2a10 10 0 0 1 10 10" stroke="#6b7280" strokeWidth="3" strokeLinecap="round" /></svg> Loading route data...
           </span>}
           {error && <span className="text-sm font-medium text-red-500">Error: {error}</span>}
           {!loading && !error && <span className="text-xs text-emerald-500 font-medium ml-auto flex items-center gap-1">
-             <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span> Live Sync Active
+             {/* <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span> Live Sync Active */}
           </span>}
         </div>
       </div>
