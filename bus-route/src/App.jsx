@@ -36,6 +36,69 @@ const rowY = (i) => i * U.ROW_H + U.ROW_H / 2;
 const stopsUrl = (routeId) => `${STOPS_API_BASE_URL}/${encodeURIComponent(routeId)}.json`;
 const tripsUrl = (routeId) => `${TRIPS_API_BASE_URL}/${encodeURIComponent(routeId)}.json`;
 
+const secondsFromMidnight = (date) => (
+  date.getHours() * 3600 + date.getMinutes() * 60 + date.getSeconds()
+);
+
+const currentLocalDate = (currentTime) => {
+  const date = new Date(currentTime ?? Date.now());
+  return Number.isNaN(date.getTime()) ? new Date() : date;
+};
+
+const sameLocalServiceDate = (serviceDate, currentDate) => {
+  const serviceDateMs = Number(serviceDate);
+  if (!Number.isFinite(serviceDateMs)) {
+    return false;
+  }
+
+  const serviceDay = new Date(serviceDateMs);
+  if (Number.isNaN(serviceDay.getTime())) {
+    return false;
+  }
+
+  return serviceDay.getFullYear() === currentDate.getFullYear()
+    && serviceDay.getMonth() === currentDate.getMonth()
+    && serviceDay.getDate() === currentDate.getDate();
+};
+
+const numericTime = (value) => {
+  const time = Number(value);
+  return Number.isFinite(time) ? time : null;
+};
+
+const getScheduledTripWindow = (trip) => {
+  const stopTimes = trip.schedule?.stopTimes;
+  if (!Array.isArray(stopTimes) || stopTimes.length === 0) {
+    return null;
+  }
+
+  const firstStop = stopTimes[0];
+  const lastStop = stopTimes[stopTimes.length - 1];
+  const startSec = numericTime(firstStop?.departureTime);
+  const endSec = numericTime(lastStop?.arrivalTime ?? lastStop?.departureTime);
+
+  if (startSec === null || endSec === null) {
+    return null;
+  }
+
+  return { startSec, endSec };
+};
+
+const isScheduledActiveTrip = (trip, currentDate) => {
+  const serviceDate = trip.serviceDate ?? trip.status?.serviceDate;
+  if (!sameLocalServiceDate(serviceDate, currentDate)) {
+    return false;
+  }
+
+  const window = getScheduledTripWindow(trip);
+  if (!window) {
+    return false;
+  }
+
+  const nowSec = secondsFromMidnight(currentDate);
+  return window.startSec <= nowSec && nowSec <= window.endSec;
+};
+
 const MOJIBAKE_RE = /(?:à|Ã|Â|â|€|œ||™|‹|¢|¥|¦|§|¨|©|ª|«|¬|®|¯|°|±|²|³|´|µ|¶|·|¸|¹|º|»|¼|½|¾|¿)/;
 const WINDOWS_1252_BYTES = new Map([
   [0x20ac, 0x80], [0x201a, 0x82], [0x0192, 0x83], [0x201e, 0x84],
@@ -96,11 +159,14 @@ function getBusGeometry(bus, ox) {
   }
 }
 
-function processActiveBuses(tripsData, stopsArray) {
+function processActiveBuses(tripsData, stopsArray, currentTime) {
   if (!tripsData || !tripsData.list) return [];
 
+  const currentDate = currentLocalDate(currentTime);
   const activeTrips = tripsData.list.filter(
-    (trip) => trip.status && (trip.status.phase === "in_progress" || trip.status.phase === "")
+    (trip) => trip.status
+      && (trip.status.phase === "in_progress"
+        || (trip.status.phase === "" && isScheduledActiveTrip(trip, currentDate)))
   );
 
   const buses = [];
@@ -199,12 +265,14 @@ export default function App() {
         const errors = [];
 
         results.forEach((result, index) => {
+
           if (result.error) {
             // Safely ignore canceled requests
             if (axios.isCancel(result.error) || result.error.name === 'CanceledError') return;
 
             errors.push(`Failed to load route ${result.routeId}: ${result.error.message}`);
             return;
+
           }
 
           const [stopsRes, tripsRes] = result;
@@ -217,16 +285,19 @@ export default function App() {
             errors.push(`No stop groups found for route ${routeId}.`);
             return;
           }
+
           const orderedIds = stopGroups[0].stopIds;
           const stopMap = {};
           stopsApiData.references.stops.forEach((s) => { stopMap[s.id] = s; });
 
+
+          
           const currentStops = orderedIds.map((id) => ({
             id,
             name: decodeMojibake(stopMap[id]?.name ?? id),
           }));
 
-          const buses = processActiveBuses(tripsApiData, currentStops);
+          const buses = processActiveBuses(tripsApiData, currentStops, tripsRes.data.currentTime);
 
           newColumns.push({ stops: currentStops, buses, routeId });
         });
@@ -242,7 +313,7 @@ export default function App() {
           const intervalId = setInterval(() => {
             axios.get(tripsUrl(column.routeId), { params: { key: API_KEY } })
               .then((res) => {
-                const updatedBuses = processActiveBuses(res.data.data, column.stops);
+                const updatedBuses = processActiveBuses(res.data.data, column.stops, res.data.currentTime);
                 setColumns(prevColumns => {
                   const targetIndex = prevColumns.findIndex(c => c.routeId === column.routeId);
                   if (targetIndex === -1) return prevColumns;
