@@ -11,7 +11,7 @@ Follow these steps to set up and run the project locally.
 ### 1. Clone the Repository
 
 ```bash
-git clone <https://github.com/entrikedev/Bus-Route-Track.git>
+git clone https://github.com/entrikedev/Bus-Route-Track.git
 ```
 
 ### 2. Navigate to Project Folder
